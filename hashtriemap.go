@@ -2,14 +2,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package sync
+package hashtriemap
 
 import (
-	"internal/abi"
-	"internal/goarch"
+	"hash/maphash"
+	"reflect"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
+
+const ptrSize = uint(unsafe.Sizeof((*int)(nil)))
 
 // HashTrieMap is an implementation of a concurrent hash-trie. The implementation
 // is designed around frequent loads, but offers decent performance for stores
@@ -20,11 +23,11 @@ import (
 // It must not be copied after first use.
 type HashTrieMap[K comparable, V any] struct {
 	inited   atomic.Uint32
-	initMu   Mutex
+	initMu   sync.Mutex
 	root     atomic.Pointer[indirect[K, V]]
-	keyHash  hashFunc
-	valEqual equalFunc
-	seed     uintptr
+	keyHash  hashFunc[K]
+	valEqual equalFunc[V] // or nil if V is not comparable
+	seed     maphash.Seed
 }
 
 func (ht *HashTrieMap[K, V]) init() {
@@ -45,28 +48,42 @@ func (ht *HashTrieMap[K, V]) initSlow() {
 
 	// Set up root node, derive the hash function for the key, and the
 	// equal function for the value, if any.
-	var m map[K]V
-	mapType := abi.TypeOf(m).MapType()
 	ht.root.Store(newIndirectNode[K, V](nil))
-	ht.keyHash = mapType.Hasher
-	ht.valEqual = mapType.Elem.Equal
-	ht.seed = uintptr(runtime_rand())
+	ht.seed = maphash.MakeSeed()
+
+	ht.keyHash = func(key K, seed maphash.Seed) uint64 {
+		var h maphash.Hash
+		h.SetSeed(seed)
+		maphash.WriteComparable(&h, key)
+		return h.Sum64()
+	}
+
+	vtyp := reflect.TypeFor[V]()
+	if vtyp.Comparable() {
+		ht.valEqual = func(v1, v2 V) bool {
+			return reflect.ValueOf(v1).Equal(reflect.ValueOf(v2))
+		}
+	}
 
 	ht.inited.Store(1)
 }
 
-type hashFunc func(unsafe.Pointer, uintptr) uintptr
-type equalFunc func(unsafe.Pointer, unsafe.Pointer) bool
+type hashFunc[K comparable] func(key K, seed maphash.Seed) uint64
+
+// equalFunc is a function that compares two values of type V for equality.
+//
+// If V is not of a comparable type, equalFunc must be nil.
+type equalFunc[V any] func(v1, v2 V) bool
 
 // Load returns the value stored in the map for a key, or nil if no
 // value is present.
 // The ok result indicates whether value was found in the map.
 func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
 	ht.init()
-	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	hash := ht.keyHash(key, ht.seed)
 
 	i := ht.root.Load()
-	hashShift := 8 * goarch.PtrSize
+	hashShift := 8 * ptrSize
 	for hashShift != 0 {
 		hashShift -= nChildrenLog2
 
@@ -87,7 +104,7 @@ func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
 // The loaded result is true if the value was loaded, false if stored.
 func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool) {
 	ht.init()
-	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	hash := ht.keyHash(key, ht.seed)
 	var i *indirect[K, V]
 	var hashShift uint
 	var slot *atomic.Pointer[node[K, V]]
@@ -95,7 +112,7 @@ func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool)
 	for {
 		// Find the key or a candidate location for insertion.
 		i = ht.root.Load()
-		hashShift = 8 * goarch.PtrSize
+		hashShift = 8 * ptrSize
 		haveInsertPoint := false
 		for hashShift != 0 {
 			hashShift -= nChildrenLog2
@@ -164,9 +181,9 @@ func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool)
 
 // expand takes oldEntry and newEntry whose hashes conflict from bit 64 down to hashShift and
 // produces a subtree of indirect nodes to hold the two new entries.
-func (ht *HashTrieMap[K, V]) expand(oldEntry, newEntry *entry[K, V], newHash uintptr, hashShift uint, parent *indirect[K, V]) *node[K, V] {
+func (ht *HashTrieMap[K, V]) expand(oldEntry, newEntry *entry[K, V], newHash uint64, hashShift uint, parent *indirect[K, V]) *node[K, V] {
 	// Check for a hash collision.
-	oldHash := ht.keyHash(unsafe.Pointer(&oldEntry.key), ht.seed)
+	oldHash := ht.keyHash(oldEntry.key, ht.seed)
 	if oldHash == newHash {
 		// Store the old entry in the new entry's overflow list, then store
 		// the new entry.
@@ -204,7 +221,7 @@ func (ht *HashTrieMap[K, V]) Store(key K, new V) {
 // The loaded result reports whether the key was present.
 func (ht *HashTrieMap[K, V]) Swap(key K, new V) (previous V, loaded bool) {
 	ht.init()
-	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	hash := ht.keyHash(key, ht.seed)
 	var i *indirect[K, V]
 	var hashShift uint
 	var slot *atomic.Pointer[node[K, V]]
@@ -212,7 +229,7 @@ func (ht *HashTrieMap[K, V]) Swap(key K, new V) (previous V, loaded bool) {
 	for {
 		// Find the key or a candidate location for insertion.
 		i = ht.root.Load()
-		hashShift = 8 * goarch.PtrSize
+		hashShift = 8 * ptrSize
 		haveInsertPoint := false
 		for hashShift != 0 {
 			hashShift -= nChildrenLog2
@@ -282,7 +299,7 @@ func (ht *HashTrieMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 	if ht.valEqual == nil {
 		panic("called CompareAndSwap when value is not of comparable type")
 	}
-	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	hash := ht.keyHash(key, ht.seed)
 
 	// Find a node with the key and compare with it. n != nil if we found the node.
 	i, _, slot, n := ht.find(key, hash, ht.valEqual, old)
@@ -308,7 +325,7 @@ func (ht *HashTrieMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 // The loaded result reports whether the key was present.
 func (ht *HashTrieMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 	ht.init()
-	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	hash := ht.keyHash(key, ht.seed)
 
 	// Find a node with the key and compare with it. n != nil if we found the node.
 	i, hashShift, slot, n := ht.find(key, hash, nil, *new(V))
@@ -338,7 +355,7 @@ func (ht *HashTrieMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 
 	// Check if the node is now empty (and isn't the root), and delete it if able.
 	for i.parent != nil && i.empty() {
-		if hashShift == 8*goarch.PtrSize {
+		if hashShift == 8*ptrSize {
 			panic("internal/sync.HashTrieMap: ran out of hash bits while iterating")
 		}
 		hashShift += nChildrenLog2
@@ -370,7 +387,7 @@ func (ht *HashTrieMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 	if ht.valEqual == nil {
 		panic("called CompareAndDelete when value is not of comparable type")
 	}
-	hash := ht.keyHash(abi.NoEscape(unsafe.Pointer(&key)), ht.seed)
+	hash := ht.keyHash(key, ht.seed)
 
 	// Find a node with the key. n != nil if we found the node.
 	i, hashShift, slot, n := ht.find(key, hash, nil, *new(V))
@@ -400,7 +417,7 @@ func (ht *HashTrieMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 
 	// Check if the node is now empty (and isn't the root), and delete it if able.
 	for i.parent != nil && i.empty() {
-		if hashShift == 8*goarch.PtrSize {
+		if hashShift == 8*ptrSize {
 			panic("internal/sync.HashTrieMap: ran out of hash bits while iterating")
 		}
 		hashShift += nChildrenLog2
@@ -423,11 +440,11 @@ func (ht *HashTrieMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 // Returns a non-nil node, which will always be an entry, if found.
 //
 // If i != nil then i.mu is locked, and it is the caller's responsibility to unlock it.
-func (ht *HashTrieMap[K, V]) find(key K, hash uintptr, valEqual equalFunc, value V) (i *indirect[K, V], hashShift uint, slot *atomic.Pointer[node[K, V]], n *node[K, V]) {
+func (ht *HashTrieMap[K, V]) find(key K, hash uint64, valEqual equalFunc[V], value V) (i *indirect[K, V], hashShift uint, slot *atomic.Pointer[node[K, V]], n *node[K, V]) {
 	for {
 		// Find the key or return if it's not there.
 		i = ht.root.Load()
-		hashShift = 8 * goarch.PtrSize
+		hashShift = 8 * ptrSize
 		found := false
 		for hashShift != 0 {
 			hashShift -= nChildrenLog2
@@ -541,7 +558,7 @@ const (
 type indirect[K comparable, V any] struct {
 	node[K, V]
 	dead     atomic.Bool
-	mu       Mutex // Protects mutation to children and any children that are entry nodes.
+	mu       sync.Mutex // Protects mutation to children and any children that are entry nodes.
 	parent   *indirect[K, V]
 	children [nChildren]atomic.Pointer[node[K, V]]
 }
@@ -586,9 +603,9 @@ func (e *entry[K, V]) lookup(key K) (V, bool) {
 	return *new(V), false
 }
 
-func (e *entry[K, V]) lookupWithValue(key K, value V, valEqual equalFunc) (V, bool) {
+func (e *entry[K, V]) lookupWithValue(key K, value V, valEqual equalFunc[V]) (V, bool) {
 	for e != nil {
-		if e.key == key && (valEqual == nil || valEqual(unsafe.Pointer(&e.value), abi.NoEscape(unsafe.Pointer(&value)))) {
+		if e.key == key && (valEqual == nil || valEqual(e.value, value)) {
 			return e.value, true
 		}
 		e = e.overflow.Load()
@@ -629,8 +646,8 @@ func (head *entry[K, V]) swap(key K, new V) (*entry[K, V], V, bool) {
 // equal. Returns the new entry chain and whether or not anything was swapped.
 //
 // compareAndSwap must be called under the mutex of the indirect node which e is a child of.
-func (head *entry[K, V]) compareAndSwap(key K, old, new V, valEqual equalFunc) (*entry[K, V], bool) {
-	if head.key == key && valEqual(unsafe.Pointer(&head.value), abi.NoEscape(unsafe.Pointer(&old))) {
+func (head *entry[K, V]) compareAndSwap(key K, old, new V, valEqual equalFunc[V]) (*entry[K, V], bool) {
+	if head.key == key && valEqual(head.value, old) {
 		// Return the new head of the list.
 		e := newEntryNode(key, new)
 		if chain := head.overflow.Load(); chain != nil {
@@ -641,7 +658,7 @@ func (head *entry[K, V]) compareAndSwap(key K, old, new V, valEqual equalFunc) (
 	i := &head.overflow
 	e := i.Load()
 	for e != nil {
-		if e.key == key && valEqual(unsafe.Pointer(&e.value), abi.NoEscape(unsafe.Pointer(&old))) {
+		if e.key == key && valEqual(e.value, old) {
 			eNew := newEntryNode(key, new)
 			eNew.overflow.Store(e.overflow.Load())
 			i.Store(eNew)
@@ -679,15 +696,15 @@ func (head *entry[K, V]) loadAndDelete(key K) (V, *entry[K, V], bool) {
 // equal. Returns the new entry chain and whether or not anything was deleted.
 //
 // compareAndDelete must be called under the mutex of the indirect node which e is a child of.
-func (head *entry[K, V]) compareAndDelete(key K, value V, valEqual equalFunc) (*entry[K, V], bool) {
-	if head.key == key && valEqual(unsafe.Pointer(&head.value), abi.NoEscape(unsafe.Pointer(&value))) {
+func (head *entry[K, V]) compareAndDelete(key K, value V, valEqual equalFunc[V]) (*entry[K, V], bool) {
+	if head.key == key && valEqual(head.value, value) {
 		// Drop the head of the list.
 		return head.overflow.Load(), true
 	}
 	i := &head.overflow
 	e := i.Load()
 	for e != nil {
-		if e.key == key && valEqual(unsafe.Pointer(&e.value), abi.NoEscape(unsafe.Pointer(&value))) {
+		if e.key == key && valEqual(e.value, value) {
 			i.Store(e.overflow.Load())
 			return head, true
 		}
@@ -716,9 +733,3 @@ func (n *node[K, V]) indirect() *indirect[K, V] {
 	}
 	return (*indirect[K, V])(unsafe.Pointer(n))
 }
-
-// Pull in runtime.rand so that we don't need to take a dependency
-// on math/rand/v2.
-//
-//go:linkname runtime_rand runtime.rand
-func runtime_rand() uint64

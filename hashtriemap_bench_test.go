@@ -2,10 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package sync_test
+package hashtriemap
 
 import (
-	isync "internal/sync"
 	"testing"
 )
 
@@ -23,7 +22,7 @@ func BenchmarkHashTrieMapLoadLarge(b *testing.B) {
 
 func benchmarkHashTrieMapLoad(b *testing.B, data []string) {
 	b.ReportAllocs()
-	var m isync.HashTrieMap[string, int]
+	var m HashTrieMap[string, int]
 	for i := range data {
 		m.LoadOrStore(data[i], i)
 	}
@@ -50,7 +49,7 @@ func BenchmarkHashTrieMapLoadOrStoreLarge(b *testing.B) {
 
 func benchmarkHashTrieMapLoadOrStore(b *testing.B, data []string) {
 	b.ReportAllocs()
-	var m isync.HashTrieMap[string, int]
+	var m HashTrieMap[string, int]
 
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0

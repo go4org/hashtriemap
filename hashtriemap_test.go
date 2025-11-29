@@ -2,11 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package sync_test
+package hashtriemap
 
 import (
 	"fmt"
-	isync "internal/sync"
 	"math"
 	"runtime"
 	"strconv"
@@ -16,29 +15,28 @@ import (
 )
 
 func TestHashTrieMap(t *testing.T) {
-	testHashTrieMap(t, func() *isync.HashTrieMap[string, int] {
-		var m isync.HashTrieMap[string, int]
+	testHashTrieMap(t, func() *HashTrieMap[string, int] {
+		var m HashTrieMap[string, int]
 		return &m
 	})
 }
 
-func TestHashTrieMapBadHash(t *testing.T) {
-	testHashTrieMap(t, func() *isync.HashTrieMap[string, int] {
-		return isync.NewBadHashTrieMap[string, int]()
+func TestHashTrieMapHashAllocs(t *testing.T) {
+	var ht HashTrieMap[string, int]
+	n := testing.AllocsPerRun(100, func() {
+		for _, s := range testDataLarge {
+			_, ok := ht.Load(s)
+			if ok {
+				t.Fatalf("unexpectedly found key %q", s)
+			}
+		}
 	})
+	if n != 0 {
+		t.Errorf("expected 0 allocations, got %v", n)
+	}
 }
 
-func TestHashTrieMapTruncHash(t *testing.T) {
-	testHashTrieMap(t, func() *isync.HashTrieMap[string, int] {
-		// Stub out the good hash function with a different terrible one
-		// (truncated hash). Everything should still work as expected.
-		// This is useful to test independently to catch issues with
-		// near collisions, where only the last few bits of the hash differ.
-		return isync.NewTruncHashTrieMap[string, int]()
-	})
-}
-
-func testHashTrieMap(t *testing.T, newMap func() *isync.HashTrieMap[string, int]) {
+func testHashTrieMap(t *testing.T, newMap func() *HashTrieMap[string, int]) {
 	t.Run("LoadEmpty", func(t *testing.T) {
 		m := newMap()
 
@@ -719,7 +717,7 @@ func testHashTrieMap(t *testing.T, newMap func() *isync.HashTrieMap[string, int]
 	})
 }
 
-func testAll[K, V comparable](t *testing.T, m *isync.HashTrieMap[K, V], testData map[K]V, yield func(K, V) bool) {
+func testAll[K, V comparable](t *testing.T, m *HashTrieMap[K, V], testData map[K]V, yield func(K, V) bool) {
 	for k, v := range testData {
 		expectStored(t, k, v)(m.LoadOrStore(k, v))
 	}
@@ -933,7 +931,7 @@ func init() {
 func TestConcurrentCache(t *testing.T) {
 	type dummy [32]byte
 
-	var m isync.HashTrieMap[int, weak.Pointer[dummy]]
+	var m HashTrieMap[int, weak.Pointer[dummy]]
 
 	type cleanupArg struct {
 		key   int
@@ -942,7 +940,7 @@ func TestConcurrentCache(t *testing.T) {
 	cleanup := func(arg cleanupArg) {
 		m.CompareAndDelete(arg.key, arg.value)
 	}
-	get := func(m *isync.HashTrieMap[int, weak.Pointer[dummy]], key int) *dummy {
+	get := func(m *HashTrieMap[int, weak.Pointer[dummy]], key int) *dummy {
 		nv := new(dummy)
 		nw := weak.Make(nv)
 		for {
