@@ -51,12 +51,10 @@ func (ht *HashTrieMap[K, V]) initSlow() {
 	ht.root.Store(newIndirectNode[K, V](nil))
 	ht.seed = maphash.MakeSeed()
 
-	ht.keyHash = func(key K, seed maphash.Seed) uint64 {
-		var h maphash.Hash
-		h.SetSeed(seed)
-		maphash.WriteComparable(&h, key)
-		return h.Sum64()
-	}
+	// maphash.Comparable uses the runtime's native hash for K directly,
+	// unlike maphash.Hash+WriteComparable, which routes each hash
+	// through Hash's buffered state at several times the cost.
+	ht.keyHash = maphash.Comparable[K]
 
 	vtyp := reflect.TypeFor[V]()
 	if vtyp.Comparable() {
@@ -68,7 +66,7 @@ func (ht *HashTrieMap[K, V]) initSlow() {
 	ht.inited.Store(1)
 }
 
-type hashFunc[K comparable] func(key K, seed maphash.Seed) uint64
+type hashFunc[K comparable] func(seed maphash.Seed, key K) uint64
 
 // equalFunc is a function that compares two values of type V for equality.
 //
@@ -80,7 +78,7 @@ type equalFunc[V any] func(v1, v2 V) bool
 // The ok result indicates whether value was found in the map.
 func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
 	ht.init()
-	hash := ht.keyHash(key, ht.seed)
+	hash := ht.keyHash(ht.seed, key)
 
 	i := ht.root.Load()
 	hashShift := 8 * ptrSize
@@ -104,7 +102,7 @@ func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
 // The loaded result is true if the value was loaded, false if stored.
 func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool) {
 	ht.init()
-	hash := ht.keyHash(key, ht.seed)
+	hash := ht.keyHash(ht.seed, key)
 	var i *indirect[K, V]
 	var hashShift uint
 	var slot *atomic.Pointer[node[K, V]]
@@ -183,7 +181,7 @@ func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool)
 // produces a subtree of indirect nodes to hold the two new entries.
 func (ht *HashTrieMap[K, V]) expand(oldEntry, newEntry *entry[K, V], newHash uint64, hashShift uint, parent *indirect[K, V]) *node[K, V] {
 	// Check for a hash collision.
-	oldHash := ht.keyHash(oldEntry.key, ht.seed)
+	oldHash := ht.keyHash(ht.seed, oldEntry.key)
 	if oldHash == newHash {
 		// Store the old entry in the new entry's overflow list, then store
 		// the new entry.
@@ -221,7 +219,7 @@ func (ht *HashTrieMap[K, V]) Store(key K, new V) {
 // The loaded result reports whether the key was present.
 func (ht *HashTrieMap[K, V]) Swap(key K, new V) (previous V, loaded bool) {
 	ht.init()
-	hash := ht.keyHash(key, ht.seed)
+	hash := ht.keyHash(ht.seed, key)
 	var i *indirect[K, V]
 	var hashShift uint
 	var slot *atomic.Pointer[node[K, V]]
@@ -299,7 +297,7 @@ func (ht *HashTrieMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 	if ht.valEqual == nil {
 		panic("called CompareAndSwap when value is not of comparable type")
 	}
-	hash := ht.keyHash(key, ht.seed)
+	hash := ht.keyHash(ht.seed, key)
 
 	// Find a node with the key and compare with it. n != nil if we found the node.
 	i, _, slot, n := ht.find(key, hash, ht.valEqual, old)
@@ -325,7 +323,7 @@ func (ht *HashTrieMap[K, V]) CompareAndSwap(key K, old, new V) (swapped bool) {
 // The loaded result reports whether the key was present.
 func (ht *HashTrieMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 	ht.init()
-	hash := ht.keyHash(key, ht.seed)
+	hash := ht.keyHash(ht.seed, key)
 
 	// Find a node with the key and compare with it. n != nil if we found the node.
 	i, hashShift, slot, n := ht.find(key, hash, nil, *new(V))
@@ -387,7 +385,7 @@ func (ht *HashTrieMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 	if ht.valEqual == nil {
 		panic("called CompareAndDelete when value is not of comparable type")
 	}
-	hash := ht.keyHash(key, ht.seed)
+	hash := ht.keyHash(ht.seed, key)
 
 	// Find a node with the key. n != nil if we found the node.
 	i, hashShift, slot, n := ht.find(key, hash, nil, *new(V))
