@@ -6,6 +6,7 @@ package hashtriemap
 
 import (
 	"fmt"
+	"hash/maphash"
 	"math"
 	"runtime"
 	"strconv"
@@ -977,4 +978,34 @@ func TestConcurrentCache(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestLow32BitHashCollisions inserts keys whose hashes are identical
+// in their low 32 bits and differ only above, which on 32-bit
+// platforms used to make expand run out of hash bits and panic
+// because the trie only consumed 8*PtrSize bits of the 64-bit hash.
+func TestLow32BitHashCollisions(t *testing.T) {
+	var m HashTrieMap[int, int]
+	m.init()
+	m.keyHash = func(_ maphash.Seed, k int) uint64 { return uint64(k) << 32 }
+
+	const n = 1000
+	for i := range n {
+		m.Store(i, i*10)
+	}
+	for i := range n {
+		v, ok := m.Load(i)
+		if !ok || v != i*10 {
+			t.Fatalf("Load(%d) = %d, %v; want %d, true", i, v, ok, i*10)
+		}
+	}
+	for i := 0; i < n; i += 2 {
+		m.Delete(i)
+	}
+	for i := range n {
+		v, ok := m.Load(i)
+		if want := i%2 == 1; ok != want || (ok && v != i*10) {
+			t.Fatalf("after deletes, Load(%d) = %d, %v; want present=%v", i, v, ok, want)
+		}
+	}
 }

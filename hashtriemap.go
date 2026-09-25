@@ -12,7 +12,15 @@ import (
 	"unsafe"
 )
 
-const ptrSize = uint(unsafe.Sizeof((*int)(nil)))
+// hashBits is the number of bits in a key hash. The upstream
+// internal/sync version hashes to a uintptr and so descends the trie
+// through 8*PtrSize bits, but this package's hashFunc returns a
+// uint64 on every platform, so the trie must consume all 64 bits.
+// Consuming only 32 of them on 32-bit platforms made two keys whose
+// hashes agree in the low 32 bits but differ above look like they had
+// distinct hashes yet never diverge, so expand ran out of hash bits
+// and panicked.
+const hashBits = 64
 
 // HashTrieMap is an implementation of a concurrent hash-trie. The implementation
 // is designed around frequent loads, but offers decent performance for stores
@@ -81,7 +89,7 @@ func (ht *HashTrieMap[K, V]) Load(key K) (value V, ok bool) {
 	hash := ht.keyHash(ht.seed, key)
 
 	i := ht.root.Load()
-	hashShift := 8 * ptrSize
+	hashShift := hashBits
 	for hashShift != 0 {
 		hashShift -= nChildrenLog2
 
@@ -110,7 +118,7 @@ func (ht *HashTrieMap[K, V]) LoadOrStore(key K, value V) (result V, loaded bool)
 	for {
 		// Find the key or a candidate location for insertion.
 		i = ht.root.Load()
-		hashShift = 8 * ptrSize
+		hashShift = hashBits
 		haveInsertPoint := false
 		for hashShift != 0 {
 			hashShift -= nChildrenLog2
@@ -227,7 +235,7 @@ func (ht *HashTrieMap[K, V]) Swap(key K, new V) (previous V, loaded bool) {
 	for {
 		// Find the key or a candidate location for insertion.
 		i = ht.root.Load()
-		hashShift = 8 * ptrSize
+		hashShift = hashBits
 		haveInsertPoint := false
 		for hashShift != 0 {
 			hashShift -= nChildrenLog2
@@ -353,7 +361,7 @@ func (ht *HashTrieMap[K, V]) LoadAndDelete(key K) (value V, loaded bool) {
 
 	// Check if the node is now empty (and isn't the root), and delete it if able.
 	for i.parent != nil && i.empty() {
-		if hashShift == 8*ptrSize {
+		if hashShift == hashBits {
 			panic("internal/sync.HashTrieMap: ran out of hash bits while iterating")
 		}
 		hashShift += nChildrenLog2
@@ -415,7 +423,7 @@ func (ht *HashTrieMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
 
 	// Check if the node is now empty (and isn't the root), and delete it if able.
 	for i.parent != nil && i.empty() {
-		if hashShift == 8*ptrSize {
+		if hashShift == hashBits {
 			panic("internal/sync.HashTrieMap: ran out of hash bits while iterating")
 		}
 		hashShift += nChildrenLog2
@@ -442,7 +450,7 @@ func (ht *HashTrieMap[K, V]) find(key K, hash uint64, valEqual equalFunc[V], val
 	for {
 		// Find the key or return if it's not there.
 		i = ht.root.Load()
-		hashShift = 8 * ptrSize
+		hashShift = hashBits
 		found := false
 		for hashShift != 0 {
 			hashShift -= nChildrenLog2
