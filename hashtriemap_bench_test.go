@@ -6,6 +6,7 @@ package hashtriemap
 
 import (
 	"testing"
+	"unsafe"
 )
 
 func BenchmarkHashTrieMapLoadSmall(b *testing.B) {
@@ -37,6 +38,27 @@ func benchmarkHashTrieMapLoad(b *testing.B, data []string) {
 			}
 		}
 	})
+}
+
+func BenchmarkHashTrieMapLoadEphemeralString(b *testing.B) {
+	var m HashTrieMap[string, int]
+	for i, key := range testDataSmall {
+		m.Store(key, i)
+	}
+
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		source := testDataSmall[i]
+		buffer := make([]byte, len(source), 256)
+		copy(buffer, source)
+		key := unsafe.String(unsafe.SliceData(buffer), len(buffer))
+		_, _ = m.Load(key)
+		i++
+		if i == len(testDataSmall) {
+			i = 0
+		}
+	}
 }
 
 func BenchmarkHashTrieMapLoadOrStore(b *testing.B) {
